@@ -8,6 +8,14 @@ can't brick SSH access.
 Designed with the "remote CGNAT'd box I can barely reach" scenario
 in mind, but the tool is generic — it knows nothing about WireGuard.
 
+## 🤖 AI
+
+Yes, I used AI. I also committed the full conversations as the real design documents (`.ai-conversations/` - private submodule, ask me for access).
+
+They're private because I haven't scrubbed my file paths and trash talk, not because I'm hiding anything.
+
+Code is MIT. What license applies to human-AI conversation transcripts is an open question. Literally. Nobody knows yet.
+
 ## How it works
 
 ```
