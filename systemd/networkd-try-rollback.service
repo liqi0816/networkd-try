@@ -1,0 +1,14 @@
+[Unit]
+Description=networkd-try — restore /etc/systemd/network and reboot
+Documentation=file:///usr/local/sbin/networkd-try
+# Harmless no-op if the operator already ran `networkd-try ok`
+# (which removes this marker) before the timer fired.
+ConditionPathExists=/var/lib/networkd-try/pending
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/sbin/networkd-try _rollback-exec
+# This service reboots the box; it should never be considered "failed"
+# in a way that blocks further boots.
+StandardOutput=journal
+StandardError=journal

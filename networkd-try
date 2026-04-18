@@ -1,0 +1,321 @@
+#!/usr/bin/env bash
+#
+# networkd-try — safely try /etc/systemd/network changes with
+# reboot + wall-clock auto-rollback.
+#
+# Flow
+# ----
+#   sudo networkd-try begin                  # snapshot /etc/systemd/network
+#   sudoedit /etc/systemd/network/wg-*.network   # edit freely
+#   sudo networkd-try apply [-t 10m]         # arm rollback, reboot
+#   # ---- reconnect via any surviving path ----
+#   sudo networkd-try ok                     # commit (disarm + drop backup)
+#   sudo networkd-try rollback               # OR: manual restore + reboot
+#
+# Anti-brick guarantees
+# ---------------------
+#   * Deadline is absolute wall-clock (not "N minutes after boot").
+#   * Timer unit has Persistent=true → if the box is wedged past the
+#     deadline, the rollback fires at the next successful boot.
+#   * The rollback service has ConditionPathExists=…/pending so a late
+#     trigger after `ok` has cleared state becomes a harmless no-op.
+#   * `begin` and `apply` are separate commands: `apply` refuses to run
+#     if no snapshot exists.
+#   * `/etc/networkd-try/preflight.d/*.sh` run before `apply` reboots;
+#     any non-zero exit aborts.
+#
+set -euo pipefail
+
+STATE_DIR=/var/lib/networkd-try
+BACKUP_DIR="$STATE_DIR/backup"
+PENDING_FILE="$STATE_DIR/pending"
+DEADLINE_FILE="$STATE_DIR/deadline"
+NETWORK_DIR=/etc/systemd/network
+TIMER_UNIT=networkd-try-rollback.timer
+SERVICE_UNIT=networkd-try-rollback.service
+TIMER_UNIT_PATH=/etc/systemd/system/${TIMER_UNIT}
+SERVICE_UNIT_PATH=/etc/systemd/system/${SERVICE_UNIT}
+TIMER_DROPIN_DIR=/etc/systemd/system/${TIMER_UNIT}.d
+TIMER_DROPIN="${TIMER_DROPIN_DIR}/deadline.conf"
+PREFLIGHT_DIR=/etc/networkd-try/preflight.d
+LOG_TAG=networkd-try
+
+log()         { logger -t "$LOG_TAG" -- "$*" 2>/dev/null || true; echo "[$LOG_TAG] $*" >&2; }
+die()         { log "ERROR: $*"; exit 2; }
+internal_die(){ log "INTERNAL ERROR: $*"; exit 1; }
+
+need_root() { [[ $EUID -eq 0 ]] || die "must be run as root"; }
+
+has_pending()  { [[ -f "$PENDING_FILE" ]]; }
+has_deadline() { [[ -f "$DEADLINE_FILE" ]]; }
+has_backup()   { [[ -d "$BACKUP_DIR"   ]]; }
+
+timer_enabled() { systemctl is-enabled --quiet "$TIMER_UNIT" 2>/dev/null; }
+timer_active()  { systemctl is-active  --quiet "$TIMER_UNIT" 2>/dev/null; }
+timer_armed()   { timer_enabled || timer_active; }
+
+# 10m → 600, 1h → 3600, 300s → 300, bare 300 → 300
+parse_duration() {
+  local s="$1"
+  if   [[ "$s" =~ ^([0-9]+)$  ]]; then echo "${BASH_REMATCH[1]}"
+  elif [[ "$s" =~ ^([0-9]+)s$ ]]; then echo "${BASH_REMATCH[1]}"
+  elif [[ "$s" =~ ^([0-9]+)m$ ]]; then echo $(( ${BASH_REMATCH[1]} * 60 ))
+  elif [[ "$s" =~ ^([0-9]+)h$ ]]; then echo $(( ${BASH_REMATCH[1]} * 3600 ))
+  else die "cannot parse duration '$s' (use e.g. 10m, 300s, 1h, or bare seconds)"
+  fi
+}
+
+units_installed() {
+  [[ -f "$SERVICE_UNIT_PATH" && -f "$TIMER_UNIT_PATH" ]] \
+    || die "unit files missing ($SERVICE_UNIT, $TIMER_UNIT) — run install.sh"
+}
+
+# ── begin ──────────────────────────────────────────────────────────────────
+cmd_begin() {
+  need_root
+  units_installed
+  if has_pending; then
+    die "pending snapshot already exists (since $(cat "$PENDING_FILE")).
+       networkd-try status   to inspect
+       networkd-try abort    to discard (only if no timer armed)
+       networkd-try ok       to commit (if already applied)
+       networkd-try rollback to restore"
+  fi
+  mkdir -p "$STATE_DIR"
+  rm -rf "$BACKUP_DIR"
+  mkdir -p "$BACKUP_DIR"
+  rsync -aHAX --delete "$NETWORK_DIR/" "$BACKUP_DIR/"
+  date -u +%Y-%m-%dT%H:%M:%SZ > "$PENDING_FILE"
+  log "begin: snapshot of $NETWORK_DIR -> $BACKUP_DIR"
+  echo
+  echo "Snapshot taken."
+  echo "Edit $NETWORK_DIR/* freely, then:  sudo networkd-try apply [-t 10m]"
+}
+
+# ── abort ──────────────────────────────────────────────────────────────────
+cmd_abort() {
+  need_root
+  has_pending || die "no pending snapshot"
+  if timer_armed; then
+    die "rollback timer is armed — use 'ok' (commit) or 'rollback' (restore) instead"
+  fi
+  rm -rf "$BACKUP_DIR"
+  rm -f  "$PENDING_FILE" "$DEADLINE_FILE"
+  log "abort: pending snapshot discarded"
+}
+
+# ── preflight ──────────────────────────────────────────────────────────────
+run_preflight() {
+  [[ -d "$PREFLIGHT_DIR" ]] || return 0
+  shopt -s nullglob
+  local f rc
+  for f in "$PREFLIGHT_DIR"/*.sh; do
+    [[ -x "$f" ]] || continue
+    echo "[preflight] $f"
+    if "$f"; then
+      echo "[preflight] $f OK"
+    else
+      rc=$?
+      shopt -u nullglob
+      die "preflight $f failed (exit $rc) — aborting apply"
+    fi
+  done
+  shopt -u nullglob
+}
+
+# ── apply ──────────────────────────────────────────────────────────────────
+cmd_apply() {
+  need_root
+  units_installed
+  has_pending || die "no pending snapshot. Run 'networkd-try begin' first."
+
+  local timeout=10m dry_run=0
+  while (( $# )); do
+    case "$1" in
+      -t|--timeout) timeout="${2:?}"; shift 2 ;;
+      -n|--dry-run) dry_run=1; shift ;;
+      -h|--help) echo "Usage: networkd-try apply [-t DURATION] [-n]"; return 0 ;;
+      *) die "unknown option: $1" ;;
+    esac
+  done
+
+  local secs
+  secs=$(parse_duration "$timeout")
+  (( secs >= 60 )) || die "timeout too short (<60s): $timeout"
+
+  run_preflight
+
+  # Absolute wall-clock deadline in systemd OnCalendar format (UTC).
+  local deadline
+  deadline=$(date -u -d "+${secs} seconds" +'%Y-%m-%d %H:%M:%S UTC')
+
+  if (( dry_run )); then
+    echo "[dry-run] would arm rollback for: $deadline"
+    echo "[dry-run] would write drop-in:    $TIMER_DROPIN"
+    echo "[dry-run] would reboot"
+    return 0
+  fi
+
+  echo "$deadline" > "$DEADLINE_FILE"
+
+  mkdir -p "$TIMER_DROPIN_DIR"
+  cat > "$TIMER_DROPIN" <<EOF
+# Auto-generated by: networkd-try apply
+# Do not edit by hand — use 'networkd-try ok' or 'rollback' to clear.
+[Timer]
+OnCalendar=
+OnCalendar=${deadline}
+EOF
+
+  systemctl daemon-reload
+  systemctl enable --now "$TIMER_UNIT"
+
+  # Sanity: confirm timer is listed and active.
+  timer_active || internal_die "$TIMER_UNIT failed to become active"
+
+  log "apply: armed rollback for ${deadline} (~${secs}s) — rebooting"
+  echo
+  echo "============================================================"
+  echo "  Rollback armed:  ${deadline}"
+  echo "  (~${secs}s / $(( secs/60 ))m$(( secs%60 ))s from now)"
+  echo
+  echo "  Rebooting NOW. Reconnect before the deadline and run:"
+  echo "     sudo networkd-try ok        # commit"
+  echo "     sudo networkd-try rollback  # manual restore + reboot"
+  echo "============================================================"
+  sync
+  systemctl reboot
+}
+
+# ── ok (commit) ────────────────────────────────────────────────────────────
+cmd_ok() {
+  need_root
+  has_pending || die "no pending change to commit"
+  if timer_enabled; then
+    systemctl disable --now "$TIMER_UNIT" >/dev/null 2>&1 || true
+  else
+    systemctl stop "$TIMER_UNIT" 2>/dev/null || true
+  fi
+  rm -f "$TIMER_DROPIN"
+  rmdir --ignore-fail-on-non-empty "$TIMER_DROPIN_DIR" 2>/dev/null || true
+  systemctl daemon-reload
+  rm -rf "$BACKUP_DIR"
+  rm -f  "$PENDING_FILE" "$DEADLINE_FILE"
+  log "ok: change committed, rollback disarmed, backup removed"
+}
+
+# ── rollback shared machinery ─────────────────────────────────────────────
+do_rollback_restore() {
+  has_backup || internal_die "no backup at $BACKUP_DIR"
+  log "rollback: restoring $NETWORK_DIR from $BACKUP_DIR"
+  rsync -aHAX --delete "$BACKUP_DIR/" "$NETWORK_DIR/"
+  systemctl disable "$TIMER_UNIT" >/dev/null 2>&1 || true
+  rm -f "$TIMER_DROPIN"
+  rmdir --ignore-fail-on-non-empty "$TIMER_DROPIN_DIR" 2>/dev/null || true
+  systemctl daemon-reload 2>/dev/null || true
+  rm -rf "$BACKUP_DIR"
+  rm -f  "$PENDING_FILE" "$DEADLINE_FILE"
+}
+
+# ── rollback (user-invoked) ───────────────────────────────────────────────
+cmd_rollback() {
+  need_root
+  has_pending || die "no pending change to roll back"
+  do_rollback_restore
+  log "rollback: rebooting to apply restored config"
+  sync
+  systemctl reboot
+}
+
+# ── _rollback-exec (timer-invoked) ────────────────────────────────────────
+cmd_rollback_exec() {
+  if ! has_pending; then
+    log "_rollback-exec: no pending marker — nothing to do"
+    exit 0
+  fi
+  do_rollback_restore
+  log "_rollback-exec: deadline hit — rebooting"
+  systemctl reboot
+}
+
+# ── status ────────────────────────────────────────────────────────────────
+cmd_status() {
+  if has_pending; then
+    echo "state:      PENDING"
+    echo "since:      $(cat "$PENDING_FILE")"
+  else
+    echo "state:      clean (no pending change)"
+  fi
+
+  if has_deadline; then
+    local now_ts dl_ts remaining dl_raw
+    dl_raw=$(cat "$DEADLINE_FILE")
+    echo "deadline:   $dl_raw"
+    now_ts=$(date -u +%s)
+    dl_ts=$(date -u -d "$dl_raw" +%s 2>/dev/null || echo 0)
+    if (( dl_ts > 0 )); then
+      remaining=$(( dl_ts - now_ts ))
+      if (( remaining > 0 )); then
+        echo "remaining:  ${remaining}s (~$(( remaining / 60 ))m$(( remaining % 60 ))s)"
+      else
+        echo "remaining:  OVERDUE by $(( -remaining ))s"
+      fi
+    fi
+  fi
+
+  echo
+  echo "timer:"
+  printf '  enabled: %s\n' "$(systemctl is-enabled "$TIMER_UNIT" 2>&1 || true)"
+  printf '  active:  %s\n' "$(systemctl is-active  "$TIMER_UNIT" 2>&1 || true)"
+  systemctl list-timers --all "$TIMER_UNIT" 2>/dev/null | sed 's/^/  /' || true
+
+  echo
+  if has_backup; then
+    echo "diff (backup → live, empty means identical):"
+    diff -ruN "$BACKUP_DIR" "$NETWORK_DIR" || true
+  else
+    echo "(no backup on disk)"
+  fi
+}
+
+# ── usage ─────────────────────────────────────────────────────────────────
+usage() {
+  cat <<'USAGE'
+networkd-try — safely try /etc/systemd/network changes with reboot auto-rollback.
+
+Commands:
+  begin                 snapshot current /etc/systemd/network
+  apply [-t 10m] [-n]   arm rollback timer, then reboot to try the new config
+                        -t DURATION   (10m default; accepts 300s, 10m, 1h, …)
+                        -n / --dry-run  print plan, do not reboot
+  ok | commit           disarm timer, drop backup (call this if all is well)
+  rollback              manual restore + reboot (what the timer would do)
+  abort                 discard pending snapshot (only valid BEFORE apply)
+  status                show pending state, deadline, timer, diff
+
+Typical flow:
+  sudo networkd-try begin
+  sudoedit /etc/systemd/network/wg0.network          # edit freely
+  sudo networkd-try apply -t 10m                     # reboots
+  # … reconnect within 10 minutes …
+  sudo networkd-try ok                               # commit
+
+Preflight hooks: /etc/networkd-try/preflight.d/*.sh (executable, run before reboot)
+USAGE
+}
+
+main() {
+  local cmd="${1:-}"; shift || true
+  case "$cmd" in
+    begin)             cmd_begin          "$@" ;;
+    apply)             cmd_apply          "$@" ;;
+    ok|commit)         cmd_ok             "$@" ;;
+    rollback)          cmd_rollback       "$@" ;;
+    abort)             cmd_abort          "$@" ;;
+    status)            cmd_status         "$@" ;;
+    _rollback-exec)    cmd_rollback_exec  "$@" ;;
+    ""|-h|--help|help) usage ;;
+    *) usage; exit 2 ;;
+  esac
+}
+main "$@"

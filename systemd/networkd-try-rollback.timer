@@ -1,0 +1,15 @@
+[Unit]
+Description=networkd-try — deadline for auto-rollback
+Documentation=file:///usr/local/sbin/networkd-try
+
+[Timer]
+# The actual OnCalendar= wall-clock deadline is written at `apply` time via a
+# drop-in at /etc/systemd/system/networkd-try-rollback.timer.d/deadline.conf.
+# If the box is wedged past the deadline (rare: long fsck, boot loop, etc.),
+# Persistent=true makes the rollback fire on the next successful boot.
+Persistent=true
+AccuracySec=1s
+Unit=networkd-try-rollback.service
+
+[Install]
+WantedBy=timers.target
